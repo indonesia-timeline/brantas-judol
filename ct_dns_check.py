@@ -35,7 +35,7 @@ _dns_resolver: Optional[aiodns.DNSResolver] = None
 def _get_dns_resolver() -> aiodns.DNSResolver:
     global _dns_resolver
     if _dns_resolver is None:
-        _dns_resolver = aiodns.DNSResolver(timeout=5.0)
+        _dns_resolver = aiodns.DNSResolver(nameservers=['1.1.1.1', '8.8.8.8'], timeout=8.0)
     return _dns_resolver
 
 async def _close_dns_resolver():
@@ -49,22 +49,44 @@ def _parse_repo(repo: str):
     parts = path.split('/')
     return parts[0], parts[1]
 
-def load_checkpoint(path: str = CHECKPOINT_PATH, default_index: int = 1) -> int:
+async def load_checkpoint(client: httpx.AsyncClient = None, path: str = CHECKPOINT_PATH, default_index: int = 1) -> int:
     try:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
             return int(data.get('last_index', default_index))
     except Exception:
-        return default_index
+        pass
+    if client and GITHUB_TOKEN:
+        owner, repo = _parse_repo(GITHUB_REPO)
+        headers = {'Authorization': f'Bearer {GITHUB_TOKEN}', 'Accept': 'application/vnd.github.v3+json'}
+        try:
+            resp = await client.get(
+                f"https://api.github.com/repos/{owner}/{repo}/contents/{path}",
+                headers=headers, timeout=httpx.Timeout(connect=10, read=20, write=10, pool=5)
+            )
+            if resp.status_code == 200:
+                content = base64.b64decode(resp.json()['content']).decode()
+                data = json.loads(content)
+                idx = int(data.get('last_index', default_index))
+                print(f"[*] Checkpoint dari GitHub: index {idx:,}")
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump({'last_index': idx, 'updated_at': time.time()}, f)
+                return idx
+        except Exception:
+            pass
+    return default_index
 
-def save_checkpoint(last_index: int, path: str = CHECKPOINT_PATH):
+async def save_checkpoint(last_index: int, client: httpx.AsyncClient = None, path: str = CHECKPOINT_PATH):
     tmp_path = path + '.tmp'
     try:
         with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump({'last_index': last_index, 'updated_at': time.time()}, f)
         os.replace(tmp_path, path)
     except Exception as e:
-        print(f"[!] Gagal menyimpan checkpoint: {e}")
+        print(f"[!] Gagal menyimpan checkpoint lokal: {e}")
+    if client and GITHUB_TOKEN:
+        content = json.dumps({'last_index': last_index, 'updated_at': time.time()})
+        await github_upload(path, content, client)
 
 async def github_upload(filename: str, content: str, client: httpx.AsyncClient):
     if not GITHUB_TOKEN:
@@ -132,12 +154,12 @@ def render_progress_bar(label: str, done: int, total: int, stats_str: str = '',
 def _backoff(attempt: int, base: float = 1.0, cap: float = 10.0) -> float:
     return min(cap, base * 2 ** attempt) * random.uniform(0.5, 1.5)
 
-async def dns_check(domain: str, attempts: int = 2, base_timeout: float = 5.0) -> bool:
+async def dns_check(domain: str, attempts: int = 1, base_timeout: float = 8.0) -> bool:
     resolver = _get_dns_resolver()
     for i in range(attempts):
         try:
             await asyncio.wait_for(
-                resolver.getaddrinfo(domain, socket.AF_UNSPEC, port=80),
+                resolver.gethostbyname(domain, socket.AF_INET),
                 timeout=base_timeout,
             )
             return True
@@ -411,11 +433,12 @@ async def main():
     print("="*60 + "\n")
 
     round_num = 0
-    next_index = load_checkpoint(default_index=DEFAULT_START_INDEX)
-    if next_index != DEFAULT_START_INDEX:
-        print(f"[*] Melanjutkan dari checkpoint: index {next_index:,}\n")
 
     async with httpx.AsyncClient() as client:
+        next_index = await load_checkpoint(client, default_index=DEFAULT_START_INDEX)
+        if next_index != DEFAULT_START_INDEX:
+            print(f"[*] Melanjutkan dari checkpoint GitHub: index {next_index:,}\n")
+
         try:
             while True:
                 round_num += 1
@@ -425,7 +448,7 @@ async def main():
 
                 next_index, domains = await collector(LOG_URL, round_start_index, TARGET_PER_ROUND)
 
-                save_checkpoint(next_index)
+                await save_checkpoint(next_index, client)
 
                 if domains:
                     all_content = '\n'.join(sorted(domains)) + '\n'
