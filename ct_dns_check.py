@@ -435,8 +435,9 @@ async def main():
 
                     live_content = '\n'.join(sorted(dns_results['ok'])) + '\n'
 
-                    await github_upload(f"domains_{round_start_index}.txt", all_content, client)
-                    await github_upload(f"dns_live_{round_start_index}.txt", live_content, client)
+                    folder = f"round_{round_start_index}"
+                    await github_upload(f"{folder}/domains_{round_start_index}.txt", all_content, client)
+                    await github_upload(f"{folder}/dns_live_{round_start_index}.txt", live_content, client)
 
                     print(f"[DNS] Hasil: {len(dns_results['ok'])} resolve, {len(dns_results['fail'])} gagal")
                 else:
